@@ -18,402 +18,298 @@ class GH:
     @classmethod
     def get_changed_files(cls, strict=False) -> List[str]:
         info = Info()
-        res = None
 
         if not info.is_local_run:
             repo_name = info.repo_name
             sha = info.sha
         else:
-            repo_name = Shell.get_output(
-                f"git config --get remote.origin.url | sed -E 's#(git@|https://)[^/:]+[:/](.*)\.git#\\2#'",
-                strict=True,
-            )
-            sha = Shell.get_output(f"git rev-parse HEAD", strict=True)
+            git_url = Shell.get_output(["git", "config", "--get", "remote.origin.url"], strict=True)
+            match = re.search(r"(git@|https?://)[^/:]+[:/](.*)\.git$", git_url)
+            repo_name = match.group(2) if match else None
+            if not repo_name:
+                raise RuntimeError(f"Failed to parse repo name from git remote: {git_url}")
+            sha = Shell.get_output(["git", "rev-parse", "HEAD"], strict=True)
 
-        assert repo_name
-        print(repo_name)
+        print(f"Using repo: {repo_name}")
 
         for attempt in range(3):
-            # store changed files
             if info.pr_number > 0:
-                exit_code, changed_files_str, err = Shell.get_res_stdout_stderr(
-                    f"gh pr view {info.pr_number} --repo {repo_name} --json files --jq '.files[].path'",
-                )
-                assert exit_code == 0, "Failed to retrieve changed files list"
+                cmd = [
+                    "gh", "pr", "view", str(info.pr_number),
+                    "--repo", repo_name,
+                    "--json", "files",
+                    "--jq", ".files[].path"
+                ]
             else:
-                exit_code, changed_files_str, err = Shell.get_res_stdout_stderr(
-                    f"gh api repos/{repo_name}/commits/{sha} | jq -r '.files[].filename'",
-                )
+                cmd = [
+                    "gh", "api",
+                    f"repos/{repo_name}/commits/{sha}",
+                    "--jq", ".files[].filename"
+                ]
 
-            if exit_code == 0:
-                res = changed_files_str.split("\n") if changed_files_str else []
+            code, out, err = Shell.get_res_stdout_stderr(cmd)
+            if code == 0:
+                return [f for f in out.splitlines() if f.strip()]
+
+            print(f"Attempt {attempt + 1} failed (code {code}): {err}")
+            if code > 1:
                 break
-            else:
-                print(
-                    f"Failed to get changed files, attempt [{attempt+1}], exit code [{exit_code}], error [{err}]"
-                )
-                if exit_code > 1:
-                    # assume that exit code == 1 is retryable - Fix if not true
-                    # exit_code 1 for this type of errors:  WARNING: stderr: GraphQL: Something went wrong while executing your query on 2025-08-05T15:33:56Z. Please include `E746:1CAA99:44F9F67:8B9B520:68922464` when reporting this issue.
-                    print("error is not retryable - break")
-                    break
-                time.sleep(1)
+            time.sleep(1)
 
-        if res is None and strict:
-            raise RuntimeError("Failed to get changed files")
-
-        return res
+        if strict:
+            raise RuntimeError("Failed to get changed files after retries")
+        return []
 
     @classmethod
     def do_command_with_retries(cls, command):
-        res = False
-        retry_count = 0
-        out, err = "", ""
-
-        while retry_count < Settings.MAX_RETRIES_GH and not res:
-            ret_code, out, err = Shell.get_res_stdout_stderr(command, verbose=True)
-            res = ret_code == 0
-            if not res and "Validation Failed" in err:
-                print(f"ERROR: GH command validation error {[err]}")
-                break
-            if not res and "Bad credentials" in err:
-                print("ERROR: GH credentials/auth failure")
-                break
-            if not res and "Resource not accessible" in err:
-                print("ERROR: GH permissions failure")
-                break
-            if not res:
-                retry_count += 1
-                time.sleep(5)
-
-        if not res:
-            print(
-                f"ERROR: Failed to execute gh command [{command}] out:[{out}] err:[{err}] after [{retry_count}] attempts"
-            )
-        return res
+        for _ in range(Settings.MAX_RETRIES_GH):
+            code, out, err = Shell.get_res_stdout_stderr(command, verbose=True)
+            if code == 0:
+                return True
+            if any(p in err for p in ["Validation Failed", "Bad credentials", "Resource not accessible"]):
+                return False
+            time.sleep(5)
+        return False
 
     @classmethod
-    def post_pr_comment(
-        cls, comment_body, or_update_comment_with_substring="", pr=None, repo=None
-    ):
-        if not repo:
-            repo = _Environment.get().REPOSITORY
-        if not pr:
-            pr = _Environment.get().PR_NUMBER
-        if or_update_comment_with_substring:
-            print(f"check comment [{comment_body}] created")
-            cmd_check_created = f'gh api -H "Accept: application/vnd.github.v3+json" \
-                "/repos/{repo}/issues/{pr}/comments" \
-                --jq \'.[] | {{id: .id, body: .body}}\' | grep -F "{or_update_comment_with_substring}"'
-            output = Shell.get_output(cmd_check_created)
-            if output:
-                comment_ids = []
+    def post_pr_comment(cls, comment_body, or_update_comment_with_substring="", pr=None, repo=None):
+        repo = repo or _Environment.get().REPOSITORY
+        pr = pr or _Environment.get().PR_NUMBER
+        path = None
+
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8") as f:
+                f.write(comment_body)
+                path = f.name
+
+            if or_update_comment_with_substring:
+                raw = Shell.get_output([
+                    "gh", "api",
+                    "-H", "Accept: application/vnd.github.v3+json",
+                    f"/repos/{repo}/issues/{pr}/comments",
+                    "--jq", ".[] | {id: .id, body: .body}"
+                ])
+                for line in raw.splitlines():
+                    if not line.strip():
+                        continue
+                    data = json.loads(line)
+                    if or_update_comment_with_substring in data.get("body", ""):
+                        comment_id = data["id"]
+                        cmd = [
+                            "gh", "api", "-X", "PATCH",
+                            "-H", "Accept: application/vnd.github.v3+json",
+                            f"/repos/{repo}/issues/comments/{comment_id}",
+                            "-F", f"body=@{path}"
+                        ]
+                        return cls.do_command_with_retries(cmd)
+
+            cmd = ["gh", "pr", "comment", str(pr), "--body-file", path]
+            return cls.do_command_with_retries(cmd)
+
+        finally:
+            if path and os.path.exists(path):
                 try:
-                    comment_ids = [
-                        json.loads(item.strip())["id"] for item in output.split("\n")
-                    ]
-                except Exception as ex:
-                    print(f"Failed to retrieve PR comments with [{ex}]")
-                for id in comment_ids:
-                    cmd = f'gh api \
-                       -X PATCH \
-                          -H "Accept: application/vnd.github.v3+json" \
-                             "/repos/{repo}/issues/comments/{id}" \
-                             -f body=\'{comment_body}\''
-                    print(f"Update existing comments [{id}]")
-                    return cls.do_command_with_retries(cmd)
-        cmd = f'gh pr comment {pr} --body "{comment_body}"'
-        return cls.do_command_with_retries(cmd)
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     @classmethod
-    def post_updateable_comment(
-        cls,
-        comment_tags_and_bodies: Dict[str, str],
-        pr=None,
-        repo=None,
-        only_update=False,
-    ):
-        if not repo:
-            repo = _Environment.get().REPOSITORY
-        if not pr:
-            pr = _Environment.get().PR_NUMBER
+    def post_updateable_comment(cls, comment_tags_and_bodies: Dict[str, str], pr=None, repo=None, only_update=False):
+        repo = repo or _Environment.get().REPOSITORY
+        pr = pr or _Environment.get().PR_NUMBER
 
-        TAG_COMMENT_START = "<!-- CI automatic comment start :{TAG}: -->"
-        TAG_COMMENT_END = "<!-- CI automatic comment end :{TAG}: -->"
-        cmd_check_created = f'gh api -H "Accept: application/vnd.github.v3+json" \
-            "/repos/{repo}/issues/{pr}/comments" \
-            --jq \'[.[] | {{id: .id, body: .body}}]\' --paginate'
-        output = Shell.get_output(cmd_check_created, verbose=True)
+        START = "<!-- CI automatic comment start :{TAG}: -->"
+        END   = "<!-- CI automatic comment end :{TAG}: -->"
 
-        comments = json.loads(output)
+        output = Shell.get_output([
+            "gh", "api",
+            "-H", "Accept: application/vnd.github.v3+json",
+            f"/repos/{repo}/issues/{pr}/comments",
+            "--jq", "[.[] | {id: .id, body: .body}]",
+            "--paginate"
+        ], verbose=True)
 
-        comment_to_update = None
-        id_to_update = None
-        for tag, body in comment_tags_and_bodies.items():
-            start_tag = TAG_COMMENT_START.format(TAG=tag)
-            end_tag = TAG_COMMENT_END.format(TAG=tag)
-            if not comment_to_update:
-                for comment in comments:
-                    if start_tag in comment["body"] and end_tag in comment["body"]:
-                        comment_to_update = comment
-                        id_to_update = comment["id"]
-                        print(f"Found comment to update [{id_to_update}]")
-                        break
+        comments = json.loads(output) if output.strip() else []
+        comment_id = None
+        existing_body = ""
+
+        for tag in comment_tags_and_bodies:
+            s = START.format(TAG=tag)
+            e = END.format(TAG=tag)
+            for c in comments:
+                if s in c["body"] and e in c["body"]:
+                    comment_id = c["id"]
+                    existing_body = c["body"]
+                    break
+            if comment_id:
+                break
+
+        body = existing_body
+        for tag, content in comment_tags_and_bodies.items():
+            s = START.format(TAG=tag)
+            e = END.format(TAG=tag)
+            if s in body and e in body:
+                body = re.sub(f"{re.escape(s)}.*?{re.escape(e)}", f"{s}\n{content}\n{e}", body, flags=re.DOTALL)
             else:
-                if (
-                    start_tag not in comment_to_update["body"]
-                    or end_tag not in comment_to_update["body"]
-                ):
-                    print(
-                        f"WARNING: Comment [{id_to_update}] has no tag [{tag}] - will append"
-                    )
+                body += f"{s}\n{content}\n{e}\n"
 
-        body = "" if not comment_to_update else comment_to_update["body"]
-        for tag, tag_body in comment_tags_and_bodies.items():
-            start_tag = TAG_COMMENT_START.format(TAG=tag)
-            end_tag = TAG_COMMENT_END.format(TAG=tag)
-            if not comment_to_update:
-                body += f"{start_tag}\n{tag_body}\n{end_tag}\n"
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8") as f:
+                f.write(body)
+                path = f.name
+
+            if comment_id:
+                cmd = [
+                    "gh", "api", "-X", "PATCH",
+                    "-H", "Accept: application/vnd.github.v3+json",
+                    f"/repos/{repo}/issues/comments/{comment_id}",
+                    "-F", f"body=@{path}"
+                ]
+            elif not only_update:
+                cmd = ["gh", "pr", "comment", str(pr), "--body-file", path]
             else:
-                if start_tag in body and end_tag in body:
-                    rex = re.compile(
-                        f"{re.escape(start_tag)}.*{re.escape(end_tag)}", re.DOTALL
-                    )
-                    body, _ = rex.subn(f"{start_tag}\n{tag_body}\n{end_tag}", body)
-                    print(
-                        f"Updated existing comment [{id_to_update}] tag [{tag}] with [{tag_body}], new [{body}]"
-                    )
-                else:
-                    body = body.removesuffix("\n") + "\n"
-                    body += f"{start_tag}\n{tag_body}\n{end_tag}\n"
-                    print(
-                        f"Appended existing comment [{id_to_update}] tag [{tag}] with [{tag_body}], new [{body}]"
-                    )
+                return False
 
-        # Create temp file for body to avoid shell escaping issues
-        with tempfile.NamedTemporaryFile(
-            mode="w", delete=False, suffix=".txt", encoding="utf-8"
-        ) as temp_file:
-            temp_file.write(body)
-            temp_file_path = temp_file.name
+            return cls.do_command_with_retries(cmd)
 
-        res = None
-        if id_to_update:
-            cmd = f'gh api -X PATCH \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    "/repos/{repo}/issues/comments/{id_to_update}" \
-                    -F body=@{temp_file_path}'
-            print(f"Update existing comments [{id_to_update}]")
-            res = cls.do_command_with_retries(cmd)
-        else:
-            if not only_update:
-                cmd = f"gh pr comment {pr} --body-file {temp_file_path}"
-                print(f"Create new comment")
-                res = cls.do_command_with_retries(cmd)
-            else:
-                print(
-                    f"WARNING: comment to update not found, tags [{[k for k in comment_tags_and_bodies.keys()]}]"
-                )
-
-        # Clean up temp file
-        os.unlink(temp_file_path)
-
-        return res
+        finally:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     @classmethod
     def get_pr_contributors(cls, pr=None, repo=None):
-        if not repo:
-            repo = _Environment.get().REPOSITORY
-        if not pr:
-            pr = _Environment.get().PR_NUMBER
-
-        cmd = f"gh pr view {pr} --repo {repo} --json commits --jq '[.commits[].authors[].login]'"
-        contributors_str = Shell.get_output(cmd, verbose=True)
-        res = []
-        if contributors_str:
-            try:
-                res = json.loads(contributors_str)
-            except Exception:
-                print(
-                    f"ERROR: Failed to fetch contributors list for PR [{pr}], repo [{repo}]"
-                )
-                traceback.print_exc()
-        return res
+        repo = repo or _Environment.get().REPOSITORY
+        pr = pr or _Environment.get().PR_NUMBER
+        out = Shell.get_output(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "commits", "--jq", "[.commits[].authors[].login]"])
+        return json.loads(out) if out.strip() else []
 
     @classmethod
     def get_pr_labels(cls, pr=None, repo=None):
-        if not repo:
-            repo = _Environment.get().REPOSITORY
-        if not pr:
-            pr = _Environment.get().PR_NUMBER
-
-        cmd = f"gh pr view {pr} --repo {repo} --json labels --jq '.labels[].name'"
-        output = Shell.get_output(cmd, verbose=True)
-        res = []
-        if output:
-            res = output.splitlines()
-        return list(set(res))
+        repo = repo or _Environment.get().REPOSITORY
+        pr = pr or _Environment.get().PR_NUMBER
+        out = Shell.get_output(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "labels", "--jq", ".labels[].name"])
+        return list(set(out.splitlines())) if out else []
 
     @classmethod
     def get_pr_title_body_labels(cls, pr=None, repo=None):
-        if not repo:
-            repo = _Environment.get().REPOSITORY
-        if not pr:
-            pr = _Environment.get().PR_NUMBER
-
-        cmd = f"gh pr view {pr} --json title,body,labels --repo {repo}"
-        output = Shell.get_output(cmd, verbose=True)
-        try:
-            pr_data = json.loads(output)
-            title = pr_data["title"]
-            body = pr_data["body"]
-            labels = [l["name"] for l in pr_data["labels"]]
-        except Exception:
-            print("ERROR: Failed to get PR data")
-            traceback.print_exc()
-            Info().store_traceback()
+        repo = repo or _Environment.get().REPOSITORY
+        pr = pr or _Environment.get().PR_NUMBER
+        out = Shell.get_output(["gh", "pr", "view", str(pr), "--json", "title,body,labels", "--repo", repo])
+        if not out.strip():
             return "", "", []
-        return title, body, labels
+        try:
+            data = json.loads(out)
+            return data.get("title", ""), data.get("body") or "", [l["name"] for l in data.get("labels", [])]
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Failed to parse PR data: {e}")
+            traceback.print_exc()
+            return "", "", []
 
     @classmethod
     def get_pr_label_assigner(cls, label, pr=None, repo=None):
-        if not repo:
-            repo = _Environment.get().REPOSITORY
-        if not pr:
-            pr = _Environment.get().PR_NUMBER
-
-        cmd = f'gh api repos/{repo}/issues/{pr}/events --jq \'.[] | select(.event=="labeled" and .label.name=="{label}") | .actor.login\''
+        repo = repo or _Environment.get().REPOSITORY
+        pr = pr or _Environment.get().PR_NUMBER
+        cmd = [
+            "gh", "api", f"repos/{repo}/issues/{pr}/events",
+            "--jq", '.[] | select(.event=="labeled" and .label.name==env.LABEL) | .actor.login',
+            f"--env=LABEL={label}"
+        ]
         return Shell.get_output(cmd, verbose=True)
 
     @classmethod
     def get_pr_diff(cls, pr=None, repo=None):
-        if not repo:
-            repo = _Environment.get().REPOSITORY
-        if not pr:
-            pr = _Environment.get().PR_NUMBER
-
-        cmd = f"gh pr diff {pr} --repo {repo}"
-        return Shell.get_output(cmd, verbose=True)
+        repo = repo or _Environment.get().REPOSITORY
+        pr = pr or _Environment.get().PR_NUMBER
+        return Shell.get_output(["gh", "pr", "diff", str(pr), "--repo", repo], verbose=True)
 
     @classmethod
     def update_pr_body(cls, new_body=None, body_file=None, pr=None, repo=None):
-        if not repo:
-            repo = _Environment.get().REPOSITORY
-        if not pr:
-            pr = _Environment.get().PR_NUMBER
+        repo = repo or _Environment.get().REPOSITORY
+        pr = pr or _Environment.get().PR_NUMBER
 
-        assert new_body or body_file, "Either new_body or body_file must be provided"
-        assert not (
-            new_body and body_file
-        ), "Cannot provide both new_body and body_file"
+        path = None
+        try:
+            if new_body:
+                with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8") as f:
+                    f.write(new_body)
+                    path = f.name
+                body_file = path
 
-        if body_file:
-            # Use file for body to avoid shell escaping issues
-            cmd = f'gh api -X PATCH \
-                -H "Accept: application/vnd.github.v3+json" \
-                "/repos/{repo}/pulls/{pr}" \
-                -F body=@{body_file}'
-        else:
-            # Use inline body (original behavior)
-            escaped_body = new_body.replace("'", "'\"'\"'")
-            cmd = f'gh api -X PATCH \
-                -H "Accept: application/vnd.github.v3+json" \
-                "/repos/{repo}/pulls/{pr}" \
-                -f body=\'{escaped_body}\''
+            cmd = [
+                "gh", "api", "-X", "PATCH",
+                "-H", "Accept: application/vnd.github.v3+json",
+                f"/repos/{repo}/pulls/{pr}",
+                "-F", f"body=@{body_file}"
+            ]
+            return cls.do_command_with_retries(cmd)
 
-        return cls.do_command_with_retries(cmd)
+        finally:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     @classmethod
     def post_commit_status(cls, name, status, description, url):
-        """
-        Sets GH commit status
-        :param name: commit status name
-        :param status:
-        :param description:
-        :param url:
-        :param repo:
-        :return: True or False in case of error
-        """
-        description_max_size = 80  # GH limits to 140, but 80 is reasonable
-        description = description[:description_max_size].replace(
-            "'", "'\"'\"'"
-        )  # escape single quote
+        description = description[:140]
         status = cls.convert_to_gh_status(status)
         repo = _Environment.get().REPOSITORY
-        command = (
-            f"gh api -X POST -H 'Accept: application/vnd.github.v3+json' "
-            f"/repos/{repo}/statuses/{_Environment.get().SHA} "
-            f"-f state='{status}' -f target_url='{url}' "
-            f"-f description='{description}' -f context='{name}'"
-        )
-        return cls.do_command_with_retries(command)
+        sha = _Environment.get().SHA
+
+        cmd = [
+            "gh", "api", "-X", "POST",
+            "-H", "Accept: application/vnd.github.v3+json",
+            f"/repos/{repo}/statuses/{sha}",
+            "-f", f"state={status}",
+            "-f", f"target_url={url}",
+            "-f", f"description={description}",
+            "-f", f"context={name}",
+        ]
+        return cls.do_command_with_retries(cmd)
 
     @classmethod
-    def post_foreign_commit_status(
-        cls, name, status, description, url, repo, commit_sha
-    ):
-        """
-        Sets GH commit status in foreign repo or commit
-        :param name: commit status name
-        :param status:
-        :param description:
-        :param url:
-        :param repo: Foreign repo
-        :param commit_sha: Commit in a foreign repo
-        :return: True or False in case of error
-        """
-        description_max_size = 80  # GH limits to 140, but 80 is reasonable
-        description = description[:description_max_size].replace(
-            "'", "'\"'\"'"
-        )  # escape single quote
+    def post_foreign_commit_status(cls, name, status, description, url, repo, commit_sha):
+        description = description[:140]
         status = cls.convert_to_gh_status(status)
-        command = (
-            f"gh api -X POST -H 'Accept: application/vnd.github.v3+json' "
-            f"/repos/{repo}/statuses/{commit_sha} "
-            f"-f state='{status}' -f target_url='{url}' "
-            f"-f description='{description}' -f context='{name}'"
-        )
-        return cls.do_command_with_retries(command)
+        cmd = [
+            "gh", "api", "-X", "POST",
+            "-H", "Accept: application/vnd.github.v3+json",
+            f"/repos/{repo}/statuses/{commit_sha}",
+            "-f", f"state={status}",
+            "-f", f"target_url={url}",
+            "-f", f"description={description}",
+            "-f", f"context={name}",
+        ]
+        return cls.do_command_with_retries(cmd)
 
     @classmethod
     def merge_pr(cls, pr=None, repo=None, squash=False, keep_branch=False):
-        if not repo:
-            repo = _Environment.get().REPOSITORY
-        if not pr:
-            pr = _Environment.get().PR_NUMBER
-
-        extra_args = ""
-        if not keep_branch:
-            extra_args += " --delete-branch"
-        if squash:
-            extra_args += " --squash"
-        else:
-            extra_args += " --merge"
-
-        cmd = f"gh pr merge {pr} --repo {repo} {extra_args}"
+        repo = repo or _Environment.get().REPOSITORY
+        pr = pr or _Environment.get().PR_NUMBER
+        extra = ["--delete-branch"] if not keep_branch else []
+        extra.append("--squash" if squash else "--merge")
+        cmd = ["gh", "pr", "merge", str(pr), "--repo", repo] + extra
         return cls.do_command_with_retries(cmd)
 
     @classmethod
     def convert_to_gh_status(cls, status):
-        if status in (
-            Result.Status.PENDING,
-            Result.Status.SUCCESS,
-            Result.Status.FAILED,
-            Result.Status.ERROR,
-        ):
-            return status
-        if status in Result.Status.RUNNING:
-            return Result.Status.PENDING
-        else:
-            assert (
-                False
-            ), f"Invalid status [{status}] to be set as GH commit status.state"
+        return {
+            Result.Status.PENDING: "pending",
+            Result.Status.SUCCESS: "success",
+            Result.Status.FAILED: "failure",
+            Result.Status.ERROR: "error",
+            Result.Status.RUNNING: "pending",
+        }.get(status, "error")
 
     @classmethod
     def print_log_in_group(cls, group_name: str, lines: Union[str, List[str]]):
-        if not isinstance(lines, (list, tuple, set)):
+        if isinstance(lines, str):
             lines = [lines]
-
         print(f"::group::{group_name}")
         for line in lines:
             print(line)
@@ -421,10 +317,12 @@ class GH:
 
     @classmethod
     def print_actions_debug_info(cls):
-        cls.print_log_in_group("GITHUB_ENVS", Shell.get_output("env | grep ^GITHUB_"))
-        cls.print_log_in_group(
-            "GITHUB_EVENT", Shell.get_output("cat $GITHUB_EVENT_PATH")
-        )
+        envs = [f"{k}={v}" for k, v in os.environ.items() if k.startswith("GITHUB_")]
+        cls.print_log_in_group("GITHUB_ENVS", envs)
+        path = os.environ.get("GITHUB_EVENT_PATH")
+        if path and os.path.exists(path):
+            with open(path) as f:
+                cls.print_log_in_group("GITHUB_EVENT", f.read())
 
     @dataclasses.dataclass
     class ResultSummaryForGH:
@@ -433,16 +331,14 @@ class GH:
         sha: str = ""
         start_time: Optional[float] = None
         duration: Optional[float] = None
-        failed_results: List["ResultSummaryForGH"] = dataclasses.field(
-            default_factory=list
-        )
+        failed_results: List["ResultSummaryForGH"] = dataclasses.field(default_factory=list)
         info: str = ""
         comment: str = ""
 
         @classmethod
         def from_result(cls, result: Result):
             MAX_TEST_CASES_PER_JOB = 10
-            MAX_JOBS_PER_SUMMARY = 10
+            MAX_JOBS_PER_SUMMARY = 15
 
             def flatten_results(results):
                 for r in results:
@@ -453,17 +349,13 @@ class GH:
 
             def extract_hlabels_info(res: Result) -> str:
                 try:
-                    hlabels = (
-                        res.ext.get("hlabels", [])
-                        if hasattr(res, "ext") and isinstance(res.ext, dict)
-                        else []
-                    )
+                    hlabels = res.ext.get("hlabels", []) if hasattr(res, "ext") and isinstance(res.ext, dict) else []
                     links = []
                     for item in hlabels:
                         if isinstance(item, (list, tuple)) and len(item) >= 2:
                             text, href = item[0], item[1]
-                        if text and href:
-                            links.append(f"[{text}]({href})")
+                            if text and href:
+                                links.append(f"[{text}]({href})")
                     return ", ".join(links)
                 except Exception:
                     return ""
@@ -480,108 +372,55 @@ class GH:
                 comment="",
             )
 
-            # Filter and sort failed/error subresults by priority
-            # Priority: FAILED (0) > ERROR (1) > others (2)
-            def get_status_priority(r):
-                if r.status == Result.Status.FAILED:
-                    return 0
-                elif r.status == Result.Status.ERROR:
-                    return 1
-                else:
-                    return 2
+            def priority(r):
+                if r.status == Result.Status.FAILED: return 0
+                if r.status == Result.Status.ERROR: return 1
+                return 2
 
-            subresults = [
-                r for r in result.results if (r.is_completed() and not r.is_ok())
-            ]
-            subresults = sorted(subresults, key=get_status_priority)
+            failed = sorted(
+                [r for r in result.results if r.is_completed() and not r.is_ok()],
+                key=priority
+            )
 
-            for sub_result in subresults:
-                failed_result = cls(
-                    name=sub_result.name,
-                    status=sub_result.status,
-                    info=extract_hlabels_info(sub_result),
-                    comment="",
-                )
-                failed_result.failed_results = [
-                    cls(
-                        name=r.name,
-                        status=r.status,
-                        info=extract_hlabels_info(r),
-                        comment="",
-                    )
-                    for r in flatten_results(sub_result.results)
+            for sub in failed:
+                fs = cls(name=sub.name, status=sub.status, info=extract_hlabels_info(sub), comment="")
+                fs.failed_results = [
+                    cls(name=r.name, status=r.status, info=extract_hlabels_info(r), comment="")
+                    for r in flatten_results(sub.results)
                     if r.is_completed() and not r.is_ok()
                 ]
-                if len(failed_result.failed_results) > MAX_TEST_CASES_PER_JOB:
-                    remaining = (
-                        len(failed_result.failed_results) - MAX_TEST_CASES_PER_JOB
-                    )
-                    note = f"{remaining} more test cases not shown"
-                    failed_result.failed_results = failed_result.failed_results[
-                        :MAX_TEST_CASES_PER_JOB
-                    ]
-                    failed_result.failed_results.append(cls(name=note, status=""))
-                summary.failed_results.append(failed_result)
+                if len(fs.failed_results) > MAX_TEST_CASES_PER_JOB:
+                    remaining = len(fs.failed_results) - MAX_TEST_CASES_PER_JOB
+                    fs.failed_results = fs.failed_results[:MAX_TEST_CASES_PER_JOB]
+                    fs.failed_results.append(cls(name=f"{remaining} more not shown", status=""))
+                summary.failed_results.append(fs)
+
             if len(summary.failed_results) > MAX_JOBS_PER_SUMMARY:
                 remaining = len(summary.failed_results) - MAX_JOBS_PER_SUMMARY
                 summary.failed_results = summary.failed_results[:MAX_JOBS_PER_SUMMARY]
                 print(f"NOTE: {remaining} more jobs not shown in PR comment")
+
             return summary
 
         def to_markdown(self):
-            if self.status == Result.Status.SUCCESS:
-                symbol = "✅"  # Green check mark
-            elif self.status == Result.Status.FAILED:
-                symbol = "❌"  # Red cross mark
-            else:
-                symbol = "⏳"  # Hourglass (in progress)
-
+            symbol = {Result.Status.SUCCESS: "✅", Result.Status.FAILED: "❌"}.get(self.status, "⏳")
             body = f"**Summary:** {symbol}\n"
-
             if self.failed_results:
                 if len(self.failed_results) > 15:
-                    body += (
-                        f"    *15 failures out of {len(self.failed_results)} shown*:\n"
-                    )
-                    self.failed_results = self.failed_results[:15]
-                body += "|job_name|test_name|status|info|comment|\n"
-                body += "|:--|:--|:-:|:--|:--|\n"
+                    body += f" *15 out of {len(self.failed_results)} failures shown*\n"
+                body += "|job_name|test_name|status|info|comment|\n|:--|:--|:-:|:--|:--|\n"
                 info = Info()
-                for failed_result in self.failed_results:
-                    job_report_url = info.get_specific_report_url(
-                        info.pr_number,
-                        info.git_branch,
-                        info.sha,
-                        failed_result.name,
-                        info.workflow_name,
-                    )
-                    body += "|[{}]({})|{}|{}|{}|{}|\n".format(
-                        failed_result.name,
-                        job_report_url,
-                        "",
-                        failed_result.status,
-                        failed_result.info or "",
-                        failed_result.comment or "",
-                    )
-                    if failed_result.failed_results:
-                        for sub_failed_result in failed_result.failed_results:
-                            body += "|{}|{}|{}|{}|{}|\n".format(
-                                "",
-                                sub_failed_result.name,
-                                sub_failed_result.status,
-                                sub_failed_result.info or "",
-                                sub_failed_result.comment or "",
-                            )
+                for job in self.failed_results[:15]:
+                    url = info.get_specific_report_url(info.pr_number, info.git_branch, info.sha, job.name, info.workflow_name)
+                    body += f"|[{job.name}]({url})||{job.status}|{job.info}|\n"
+                    for test in job.failed_results:
+                        body += f"| |{test.name}|{test.status}|{test.info}|\n"
             return body
 
 
 if __name__ == "__main__":
-    # test
     GH.post_updateable_comment(
-        comment_tags_and_bodies={
-            "test": "foobar4",
-            "test3": "foobar33",
-        },
+        comment_tags_and_bodies={"test": "foobar4", "test3": "foobar33"},
         pr=81471,
         repo="ClickHouse/ClickHouse",
     )
